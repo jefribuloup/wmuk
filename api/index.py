@@ -579,7 +579,7 @@ def submit():
             prodi,
             format_dosen(dosen_valid),
             numbered([s["judul"].strip() for s in skema_valid]),
-            numbered([s["url"].strip() for s in skema_valid]),
+            ", ".join(s["url"].strip() for s in skema_valid),
         ]
 
         saved, errs = save_to_sheets(row)
