@@ -23,7 +23,7 @@ SCOPES = [
 SPREADSHEET_ID_1     = os.environ.get("SPREADSHEET_ID", "")
 SPREADSHEET_ID_2     = os.environ.get("SPREADSHEET_ID_2", "")   # opsional
 SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON") or os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-SHEET_NAME           = os.environ.get("SHEET_NAME", "Sheet1")
+SHEET_NAME           = os.environ.get("SHEET_NAME", "Registrasi MUK")
 
 # Google Drive pribadi (@gmail.com) via OAuth2 refresh token
 GOOGLE_CLIENT_ID     = os.environ.get("GOOGLE_CLIENT_ID", "")
@@ -62,8 +62,12 @@ def get_sheet(spreadsheet_id: str):
     try:
         return sh.worksheet(SHEET_NAME)
     except gspread.WorksheetNotFound:
-        logging.warning(f"Tab '{SHEET_NAME}' tidak ada, memakai tab pertama.")
-        return sh.sheet1
+        logging.info(f"Tab '{SHEET_NAME}' tidak ada, membuat tab baru.")
+        try:
+            return sh.add_worksheet(title=SHEET_NAME, rows=1000, cols=len(HEADER))
+        except gspread.exceptions.APIError:
+            # tab baru saja dibuat oleh pengiriman lain pada saat yang sama
+            return sh.worksheet(SHEET_NAME)
 
 
 def ensure_header(sheet):
