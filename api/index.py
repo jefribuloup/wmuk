@@ -5,10 +5,11 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 
-import requests
 from flask import Flask, request, jsonify
 import gspread
 from google.oauth2.service_account import Credentials
+from google.oauth2.credentials import Credentials as UserCredentials
+from google.auth.transport.requests import AuthorizedSession, Request
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -23,15 +24,19 @@ SPREADSHEET_ID_1     = os.environ.get("SPREADSHEET_ID", "")
 SPREADSHEET_ID_2     = os.environ.get("SPREADSHEET_ID_2", "")   # opsional
 SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON", "")
 SHEET_NAME           = os.environ.get("SHEET_NAME", "Registrasi MUK")
-BLOB_TOKEN           = os.environ.get("BLOB_READ_WRITE_TOKEN", "")
+
+# Google Drive pribadi (@gmail.com) via OAuth2 refresh token
+GOOGLE_CLIENT_ID     = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
+DRIVE_FOLDER_ID      = os.environ.get("DRIVE_FOLDER_ID", "")
+DRIVE_SCOPES         = ["https://www.googleapis.com/auth/drive"]
 
 MAX_PDF_BYTES = 4 * 1024 * 1024   # batas body request Vercel ~4.5 MB
 WITA = timezone(timedelta(hours=8))
 
 HEADER = [
     "Timestamp",
-    "Nama Lengkap Kaprodi",
-    "Nomor HP Kaprodi",
     "Program Studi",
     "Dosen Diusulkan",
     "Judul Skema",
@@ -85,6 +90,51 @@ def save_to_csv(row: list):
         if not exists:
             w.writerow(HEADER)
         w.writerow(row)
+
+
+# ── Google Drive (akun pribadi, OAuth2) ───────────────────────────────────────
+def drive_session():
+    creds = UserCredentials(
+        token=None,
+        refresh_token=GOOGLE_REFRESH_TOKEN,
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=DRIVE_SCOPES,
+    )
+    creds.refresh(Request())
+    return AuthorizedSession(creds)
+
+
+def upload_to_drive(filename: str, data: bytes) -> str:
+    """Upload PDF ke folder Drive pribadi, set 'siapa saja dengan link', return link."""
+    sess = drive_session()
+    meta = {"name": filename, "mimeType": "application/pdf"}
+    if DRIVE_FOLDER_ID:
+        meta["parents"] = [DRIVE_FOLDER_ID]
+
+    boundary = "muk_boundary_7f3a9c"
+    body = (
+        f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"
+        f"{json.dumps(meta)}\r\n--{boundary}\r\nContent-Type: application/pdf\r\n\r\n"
+    ).encode("utf-8") + data + f"\r\n--{boundary}--".encode("utf-8")
+
+    r = sess.post(
+        "https://www.googleapis.com/upload/drive/v3/files"
+        "?uploadType=multipart&fields=id,webViewLink&supportsAllDrives=true",
+        data=body,
+        headers={"Content-Type": f"multipart/related; boundary={boundary}"},
+        timeout=60,
+    )
+    r.raise_for_status()
+    info = r.json()
+
+    sess.post(
+        f"https://www.googleapis.com/drive/v3/files/{info['id']}/permissions?supportsAllDrives=true",
+        json={"role": "reader", "type": "anyone"},
+        timeout=30,
+    ).raise_for_status()
+    return info["webViewLink"]
 
 
 # ── Format kolom ──────────────────────────────────────────────────────────────
@@ -233,17 +283,7 @@ HTML = r"""<!DOCTYPE html>
   </div>
 
   <div id="formWrapper">
-    <div class="section-label">Data Kaprodi</div>
-
-    <div class="field">
-      <label>Nama Lengkap Kaprodi <span class="req">*</span></label>
-      <input type="text" id="namaKaprodi" placeholder="cth. Dr. Andi Baso, S.T., M.T." />
-    </div>
-
-    <div class="field">
-      <label>Nomor HP (WhatsApp) <span class="req">*</span></label>
-      <input type="tel" id="noHp" placeholder="cth. 08123456789" />
-    </div>
+    <div class="section-label">Data Prodi</div>
 
     <div class="field">
       <label>Program Studi <span class="req">*</span></label>
@@ -398,16 +438,12 @@ HTML = r"""<!DOCTYPE html>
     alertEl.className = 'alert'; alertEl.innerHTML = '';
 
     const payload = {
-      nama_kaprodi: document.getElementById('namaKaprodi').value.trim(),
-      no_hp: document.getElementById('noHp').value.trim(),
       prodi: document.getElementById('prodi').value,
       dosen: collectDosen(),
     };
     const skema = collectSkema();
 
     const errs = [];
-    if (!payload.nama_kaprodi) errs.push('Nama Lengkap Kaprodi wajib diisi.');
-    if (!payload.no_hp) errs.push('Nomor HP wajib diisi.');
     if (!payload.prodi) errs.push('Program Studi wajib dipilih.');
     if (payload.dosen.length < 2) errs.push('Minimal 2 dosen harus diisi.');
     if (payload.dosen.some(d => !d.hp)) errs.push('No. HP setiap dosen wajib diisi.');
@@ -466,7 +502,7 @@ def index():
 
 @app.route("/upload", methods=["POST"])
 def upload():
-    """Upload satu file PDF ke Vercel Blob, kembalikan URL publiknya."""
+    """Upload satu file PDF ke Google Drive pribadi, kembalikan link-nya."""
     try:
         f = request.files.get("file")
         if not f or not f.filename:
@@ -476,24 +512,13 @@ def upload():
             return jsonify({"success": False, "errors": ["File harus berformat PDF."]}), 422
         if len(data) > MAX_PDF_BYTES:
             return jsonify({"success": False, "errors": ["Ukuran PDF maksimal 4 MB."]}), 422
-        if not BLOB_TOKEN:
-            return jsonify({"success": False, "errors": ["BLOB_READ_WRITE_TOKEN belum diatur."]}), 500
+        if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN):
+            return jsonify({"success": False, "errors": ["Kredensial Google Drive belum diatur."]}), 500
 
         stamp = datetime.now(WITA).strftime("%Y%m%d-%H%M%S")
         base = re.sub(r"[^A-Za-z0-9._-]", "_", f.filename)[:80]
-        r = requests.put(
-            f"https://blob.vercel-storage.com/muk/{stamp}-{base}",
-            headers={
-                "authorization": f"Bearer {BLOB_TOKEN}",
-                "x-api-version": "7",
-                "x-content-type": "application/pdf",
-                "x-add-random-suffix": "1",
-            },
-            data=data,
-            timeout=60,
-        )
-        r.raise_for_status()
-        return jsonify({"success": True, "url": r.json()["url"]})
+        url = upload_to_drive(f"{stamp}-{base}", data)
+        return jsonify({"success": True, "url": url})
     except Exception as e:
         logging.exception("Error di /upload")
         return jsonify({"success": False, "errors": [f"Upload gagal: {e}"]}), 500
@@ -504,15 +529,11 @@ def submit():
     try:
         data = request.get_json(force=True)
 
-        nama_kaprodi = (data.get("nama_kaprodi") or "").strip()
-        no_hp = (data.get("no_hp") or "").strip()
         prodi = (data.get("prodi") or "").strip()
         dosen_list = data.get("dosen", [])
         skema_list = data.get("skema", [])
 
         errors = []
-        if not nama_kaprodi: errors.append("Nama Lengkap Kaprodi wajib diisi.")
-        if not no_hp:        errors.append("Nomor HP wajib diisi.")
         if not prodi:        errors.append("Program Studi wajib dipilih.")
 
         dosen_valid = [d for d in dosen_list if isinstance(d, dict) and (d.get("nama") or "").strip()]
@@ -528,8 +549,6 @@ def submit():
 
         row = [
             datetime.now(WITA).strftime("%Y-%m-%d %H:%M:%S"),
-            nama_kaprodi,
-            no_hp,
             prodi,
             format_dosen(dosen_valid),
             numbered([s["judul"].strip() for s in skema_valid]),
