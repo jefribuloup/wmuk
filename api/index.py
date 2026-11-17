@@ -126,14 +126,17 @@ def upload_to_drive(filename: str, data: bytes) -> str:
         headers={"Content-Type": f"multipart/related; boundary={boundary}"},
         timeout=60,
     )
-    r.raise_for_status()
+    if not r.ok:
+        raise RuntimeError(f"Drive {r.status_code}: {r.text[:400]}")
     info = r.json()
 
-    sess.post(
+    pr = sess.post(
         f"https://www.googleapis.com/drive/v3/files/{info['id']}/permissions?supportsAllDrives=true",
         json={"role": "reader", "type": "anyone"},
         timeout=30,
-    ).raise_for_status()
+    )
+    if not pr.ok:
+        raise RuntimeError(f"Drive permissions {pr.status_code}: {pr.text[:400]}")
     return info["webViewLink"]
 
 
