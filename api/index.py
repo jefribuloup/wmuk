@@ -397,10 +397,17 @@ HTML = r"""<!DOCTYPE html>
     row.className = 'dosen-row'; row.id = `dosenRow${id}`;
     row.innerHTML = `
       <input type="text" placeholder="Nama Dosen ${id}" />
-      <input type="tel" placeholder="No. HP / WA" />
+      <input type="tel" inputmode="tel" placeholder="No. HP / WA (cth. +6281234567890)" oninput="filterHp(this)" />
       <button class="btn-remove" type="button" onclick="hapusRow('dosenRow${id}','dosenList','dosenRow',2)" title="Hapus">&#215;</button>`;
     document.getElementById('dosenList').appendChild(row);
     updateRemoveButtons('dosenList', 'dosenRow', 2);
+  }
+
+  function filterHp(el) {
+    // hanya angka dan tanda '+' (hanya di awal)
+    let v = el.value.replace(/[^0-9+]/g, '');
+    v = (v.startsWith('+') ? '+' : '') + v.replace(/\+/g, '');
+    if (v !== el.value) el.value = v;
   }
 
   function tambahSkema() {
@@ -474,6 +481,7 @@ HTML = r"""<!DOCTYPE html>
     if (!payload.prodi) errs.push('Program Studi wajib dipilih.');
     if (payload.dosen.length < 2) errs.push('Minimal 2 dosen harus diisi.');
     if (payload.dosen.some(d => !d.hp)) errs.push('No. HP setiap dosen wajib diisi.');
+    if (payload.dosen.some(d => d.hp && !/^\+?[0-9]+$/.test(d.hp))) errs.push('No. HP hanya boleh berisi angka dan tanda +.');
     skema.forEach((s, i) => {
       const n = i + 1;
       if (!s.judul) errs.push(`Judul skema ${n} wajib diisi.`);
@@ -569,6 +577,8 @@ def submit():
             if isinstance(s, dict) and (s.get("judul") or "").strip() and (s.get("url") or "").startswith("https://")
         ]
         if len(dosen_valid) < 2: errors.append("Minimal 2 dosen yang diusulkan.")
+        if any(not re.fullmatch(r"\+?[0-9]+", (d.get("hp") or "").strip()) for d in dosen_valid):
+            errors.append("No. HP hanya boleh berisi angka dan tanda +.")
         if len(skema_valid) < 1: errors.append("Minimal 1 skema (judul + file PDF).")
 
         if errors:
