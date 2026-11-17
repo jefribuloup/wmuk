@@ -86,7 +86,17 @@ def save_to_one_sheet(spreadsheet_id: str, row: list):
         return True, ""
     except Exception as e:
         logging.exception(f"[Google Sheets] Gagal ke {spreadsheet_id[:12]}...")
-        return False, f"{spreadsheet_id[:8]}...: {type(e).__name__} {e}"
+        detail = str(e)
+        cause = getattr(e, "__cause__", None)
+        resp = getattr(cause, "response", None)
+        if resp is not None:
+            detail += " | Google: " + resp.text[:350].replace("\n", " ")
+        if isinstance(e, PermissionError):
+            try:
+                detail += f" | Share spreadsheet ke: {json.loads(SERVICE_ACCOUNT_JSON)['client_email']}"
+            except Exception:
+                pass
+        return False, f"{spreadsheet_id[:8]}...: {type(e).__name__} {detail}"
 
 
 def save_to_sheets(row: list):
