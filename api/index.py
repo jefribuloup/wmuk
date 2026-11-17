@@ -23,7 +23,7 @@ SCOPES = [
 SPREADSHEET_ID_1     = os.environ.get("SPREADSHEET_ID", "")
 SPREADSHEET_ID_2     = os.environ.get("SPREADSHEET_ID_2", "")   # opsional
 SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON", "")
-SHEET_NAME           = os.environ.get("SHEET_NAME", "Registrasi MUK")
+SHEET_NAME           = os.environ.get("SHEET_NAME", "Sheet1")
 
 # Google Drive pribadi (@gmail.com) via OAuth2 refresh token
 GOOGLE_CLIENT_ID     = os.environ.get("GOOGLE_CLIENT_ID", "")
@@ -56,7 +56,12 @@ def get_credentials():
 
 def get_sheet(spreadsheet_id: str):
     gc = gspread.authorize(get_credentials())
-    return gc.open_by_key(spreadsheet_id).worksheet(SHEET_NAME)
+    sh = gc.open_by_key(spreadsheet_id)
+    try:
+        return sh.worksheet(SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        logging.warning(f"Tab '{SHEET_NAME}' tidak ada, memakai tab pertama.")
+        return sh.sheet1
 
 
 def ensure_header(sheet):
@@ -64,23 +69,26 @@ def ensure_header(sheet):
         sheet.insert_row(HEADER, 1)
 
 
-def save_to_one_sheet(spreadsheet_id: str, row: list) -> bool:
+def save_to_one_sheet(spreadsheet_id: str, row: list):
+    """Return (berhasil, pesan_error)."""
     if not spreadsheet_id:
-        return False
+        return None, ""          # tidak diisi -> dilewati
     try:
         sheet = get_sheet(spreadsheet_id)
         ensure_header(sheet)
         sheet.append_row(row, value_input_option="USER_ENTERED")
-        return True
+        return True, ""
     except Exception as e:
-        logging.error(f"[Google Sheets] Gagal ke {spreadsheet_id[:12]}...: {e}")
-        return False
+        logging.exception(f"[Google Sheets] Gagal ke {spreadsheet_id[:12]}...")
+        return False, f"{spreadsheet_id[:8]}...: {type(e).__name__} {e}"
 
 
-def save_to_sheets(row: list) -> bool:
-    ok1 = save_to_one_sheet(SPREADSHEET_ID_1, row)
-    ok2 = save_to_one_sheet(SPREADSHEET_ID_2, row)
-    return ok1 or ok2
+def save_to_sheets(row: list):
+    """Return (ada_yang_berhasil, daftar_error)."""
+    results = [save_to_one_sheet(i, row) for i in (SPREADSHEET_ID_1, SPREADSHEET_ID_2)]
+    ok_any = any(r[0] is True for r in results)
+    errs = [r[1] for r in results if r[0] is False]
+    return ok_any, errs
 
 
 def save_to_csv(row: list):
@@ -558,11 +566,15 @@ def submit():
             numbered([s["url"].strip() for s in skema_valid]),
         ]
 
-        saved = save_to_sheets(row)
+        saved, errs = save_to_sheets(row)
         if not saved:
-            save_to_csv(row)
+            save_to_csv(row)   # cadangan sementara (/tmp hilang saat redeploy)
+            return jsonify({
+                "success": False,
+                "errors": ["Data gagal masuk ke Google Sheets."] + errs,
+            }), 500
 
-        return jsonify({"success": True, "saved_to": "google_sheets" if saved else "csv_fallback"})
+        return jsonify({"success": True})
 
     except Exception as e:
         logging.exception("Error di /submit")
