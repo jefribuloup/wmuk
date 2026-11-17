@@ -22,7 +22,7 @@ SCOPES = [
 
 SPREADSHEET_ID_1     = os.environ.get("SPREADSHEET_ID", "")
 SPREADSHEET_ID_2     = os.environ.get("SPREADSHEET_ID_2", "")   # opsional
-SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON", "")
+SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON") or os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 SHEET_NAME           = os.environ.get("SHEET_NAME", "Sheet1")
 
 # Google Drive pribadi (@gmail.com) via OAuth2 refresh token
@@ -51,7 +51,9 @@ def get_credentials():
     if SERVICE_ACCOUNT_JSON:
         info = json.loads(SERVICE_ACCOUNT_JSON)
         return Credentials.from_service_account_info(info, scopes=SCOPES)
-    return Credentials.from_service_account_file("service_account.json", scopes=SCOPES)
+    if os.path.isfile("service_account.json"):
+        return Credentials.from_service_account_file("service_account.json", scopes=SCOPES)
+    raise RuntimeError("SERVICE_ACCOUNT_JSON belum diatur di Environment Variables Vercel.")
 
 
 def get_sheet(spreadsheet_id: str):
