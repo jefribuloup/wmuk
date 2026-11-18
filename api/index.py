@@ -1,4 +1,6 @@
 import os
+import time
+import io
 import re
 import csv
 import json
@@ -7,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 
 from flask import Flask, request, jsonify
 import gspread
+import requests
 from google.oauth2.service_account import Credentials
 from google.oauth2.credentials import Credentials as UserCredentials
 from google.auth.transport.requests import AuthorizedSession, Request
@@ -24,6 +27,11 @@ SPREADSHEET_ID_1     = os.environ.get("SPREADSHEET_ID", "")
 SPREADSHEET_ID_2     = os.environ.get("SPREADSHEET_ID_2", "")   # opsional
 SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON") or os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 SHEET_NAME           = os.environ.get("SHEET_NAME", "Registrasi MUK")
+
+# Daftar dosen (dropdown) — kolom B = nama
+DOSEN_SPREADSHEET_ID = os.environ.get("DOSEN_SPREADSHEET_ID", "1aiEKOyJQNCau-Yng9lDvlAoimWKRHbLcI6lExFnKmwQ")
+DOSEN_SHEET_GID      = os.environ.get("DOSEN_SHEET_GID", "0")
+DOSEN_CACHE_TTL      = 300   # detik
 
 # Google Drive pribadi (@gmail.com) via OAuth2 refresh token
 GOOGLE_CLIENT_ID     = os.environ.get("GOOGLE_CLIENT_ID", "")
@@ -179,6 +187,130 @@ def format_dosen(dosen_list: list) -> str:
 
 def numbered(items: list) -> str:
     return "\n".join(f"{i}. {x}" for i, x in enumerate(items, 1))
+
+
+_DOSEN_CACHE = {"ts": 0.0, "names": []}
+
+
+def _bersihkan_daftar(values: list) -> list:
+    """values = isi kolom B (baris pertama = header). Return nama unik, urutan asli."""
+    out, seen = [], set()
+    for i, v in enumerate(values):
+        nama = str(v or "").strip().rstrip(" ,")
+        if not nama or (i == 0 and "nama" in nama.casefold()):
+            continue
+        k = _norm(nama)
+        if k not in seen:
+            seen.add(k)
+            out.append(nama)
+    return out
+
+
+def load_daftar_dosen() -> list:
+    """Ambil nama dosen dari kolom B spreadsheet daftar dosen (cache 5 menit)."""
+    now = time.time()
+    if _DOSEN_CACHE["names"] and now - _DOSEN_CACHE["ts"] < DOSEN_CACHE_TTL:
+        return _DOSEN_CACHE["names"]
+
+    names = []
+    try:   # 1) lewat service account
+        ws = gspread.authorize(get_credentials()).open_by_key(DOSEN_SPREADSHEET_ID).get_worksheet(0)
+        names = _bersihkan_daftar(ws.col_values(2))
+    except Exception:
+        logging.warning("Daftar dosen via service account gagal, coba export CSV publik.", exc_info=True)
+    if not names:   # 2) cadangan: export CSV (sheet dibagikan 'anyone with the link')
+        try:
+            r = requests.get(
+                f"https://docs.google.com/spreadsheets/d/{DOSEN_SPREADSHEET_ID}/export",
+                params={"format": "csv", "gid": DOSEN_SHEET_GID}, timeout=15,
+            )
+            r.raise_for_status()
+            rows = list(csv.reader(io.StringIO(r.content.decode("utf-8-sig"))))
+            names = _bersihkan_daftar([row[1] if len(row) > 1 else "" for row in rows])
+        except Exception:
+            logging.exception("Gagal mengambil daftar dosen")
+
+    if names:
+        _DOSEN_CACHE.update(ts=now, names=names)
+        return names
+    return _DOSEN_CACHE["names"]     # data lama bila ada, kalau tidak: []
+
+
+def kanonikkan_dosen(dosen_list: list):
+    """Cocokkan nama yang dikirim dengan daftar dosen. Return (list_baru, errors).
+    Jika daftar tidak bisa dimuat, validasi dilewati."""
+    daftar = load_daftar_dosen()
+    if not daftar:
+        return dosen_list, []
+    peta = {_norm(n): n for n in daftar}
+    baru, errors = [], []
+    for d in dosen_list:
+        nama = (d.get("nama") or "").strip() if isinstance(d, dict) else ""
+        if not nama:
+            continue
+        kanon = peta.get(_norm(nama))
+        if kanon is None:
+            errors.append(f'Nama dosen "{nama}" tidak ada dalam daftar dosen. Pilih dari dropdown.')
+        else:
+            baru.append({**d, "nama": kanon})
+    return baru, errors
+
+
+def _norm(text: str) -> str:
+    """Normalisasi untuk perbandingan: huruf kecil, spasi rapi."""
+    return re.sub(r"\s+", " ", (text or "").strip()).casefold()
+
+
+def _nama_dari_sel(cell: str) -> list:
+    """'Budi, M.Si (+628123) | Ani (0812)' -> ['Budi, M.Si', 'Ani'] (tanpa nomor HP)."""
+    out = []
+    for part in (cell or "").split("|"):
+        nama = re.sub(r"\s*\(\+?[0-9]*\)\s*$", "", part.strip())
+        if nama:
+            out.append(nama)
+    return out
+
+
+def cek_dosen_duplikat(prodi: str, dosen_list: list) -> list:
+    """Return daftar pesan error bila ada nama dosen yang sudah diusulkan
+    di Program Studi yang sama (baris lain di spreadsheet) atau dobel dalam form ini."""
+    errors = []
+    baru = [(d.get("nama") or "").strip() for d in dosen_list if isinstance(d, dict)]
+    baru = [n for n in baru if n]
+
+    # 1) dobel di dalam form yang sama
+    seen = set()
+    for n in baru:
+        k = _norm(n)
+        if k in seen:
+            errors.append(f'Nama dosen "{n}" diisi lebih dari sekali pada form ini.')
+        seen.add(k)
+
+    # 2) sudah ada di baris lain pada prodi yang sama
+    sid = SPREADSHEET_ID_1 or SPREADSHEET_ID_2
+    if not sid:
+        return errors
+    try:
+        sheet = get_sheet(sid)
+        rows = sheet.get("B:C")          # kolom B = Program Studi, C = Dosen Diusulkan
+    except Exception:
+        logging.exception("Gagal membaca spreadsheet untuk cek dosen ganda")
+        return errors
+
+    ada = set()
+    for r in rows:
+        if len(r) < 2 or _norm(r[0]) != _norm(prodi):
+            continue
+        for n in _nama_dari_sel(r[1]):
+            ada.add(_norm(n))
+
+    done = set()
+    for n in baru:
+        k = _norm(n)
+        if k in ada and k not in done:
+            errors.append(f'Nama dosen "{n}" sudah ada (sudah diusulkan) di Program Studi {prodi}.')
+            done.add(k)
+    return errors
 
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
@@ -361,6 +493,7 @@ HTML = r"""<!DOCTYPE html>
 
     <div class="section-label">Dosen yang Diusulkan <small>(minimal 2 dosen)</small></div>
     <div class="dynamic-list" id="dosenList"></div>
+    <datalist id="dosenOptions"></datalist>
     <button class="btn-add" type="button" onclick="tambahDosen()">+ Tambah Dosen</button>
 
     <div class="section-label">Skema Kompetensi <small>(judul + file PDF, maks. 4 MB per file)</small></div>
@@ -385,9 +518,37 @@ HTML = r"""<!DOCTYPE html>
   const MAX_PDF = 4 * 1024 * 1024;
   let dosenCount = 0, skemaCount = 0;
 
+  let DAFTAR_DOSEN = [];
+
+  async function muatDosen() {
+    try {
+      const r = await fetch('/api/dosen');
+      const j = await r.json();
+      if (!j.success) throw new Error('gagal');
+      DAFTAR_DOSEN = j.dosen;
+      document.getElementById('dosenOptions').innerHTML =
+        DAFTAR_DOSEN.map(n => `<option value="${n.replace(/"/g, '&quot;')}"></option>`).join('');
+    } catch (e) {
+      showErrors(['Daftar dosen gagal dimuat. Muat ulang halaman.']);
+    }
+  }
+
+  function cariDosen(v) {
+    const k = (v || '').trim().replace(/\s+/g, ' ').toLowerCase();
+    return DAFTAR_DOSEN.find(n => n.toLowerCase() === k);
+  }
+
+  function cekNamaDosen(el) {
+    if (!DAFTAR_DOSEN.length || !el.value.trim()) return;
+    const n = cariDosen(el.value);
+    if (n) el.value = n;
+    else { el.value = ''; showErrors(['Nama dosen harus dipilih dari daftar dropdown.']); }
+  }
+
   function init() {
     tambahDosen(); tambahDosen();
     tambahSkema();
+    muatDosen();
   }
 
   function tambahDosen() {
@@ -396,7 +557,7 @@ HTML = r"""<!DOCTYPE html>
     const row = document.createElement('div');
     row.className = 'dosen-row'; row.id = `dosenRow${id}`;
     row.innerHTML = `
-      <input type="text" placeholder="Nama Dosen ${id}" />
+      <input type="text" list="dosenOptions" autocomplete="off" placeholder="Pilih Nama Dosen ${id}" onchange="cekNamaDosen(this)" />
       <input type="tel" inputmode="tel" placeholder="No. HP / WA (cth. +6281234567890)" oninput="filterHp(this)" />
       <button class="btn-remove" type="button" onclick="hapusRow('dosenRow${id}','dosenList','dosenRow',2)" title="Hapus">&#215;</button>`;
     document.getElementById('dosenList').appendChild(row);
@@ -480,6 +641,7 @@ HTML = r"""<!DOCTYPE html>
     const errs = [];
     if (!payload.prodi) errs.push('Program Studi wajib dipilih.');
     if (payload.dosen.length < 2) errs.push('Minimal 2 dosen harus diisi.');
+    if (DAFTAR_DOSEN.length && payload.dosen.some(d => !cariDosen(d.nama))) errs.push('Nama dosen harus dipilih dari daftar dropdown.');
     if (payload.dosen.some(d => !d.hp)) errs.push('No. HP setiap dosen wajib diisi.');
     if (payload.dosen.some(d => d.hp && !/^\+?[0-9]+$/.test(d.hp))) errs.push('No. HP hanya boleh berisi angka dan tanda +.');
     skema.forEach((s, i) => {
@@ -495,6 +657,15 @@ HTML = r"""<!DOCTYPE html>
     const txt = btn.querySelector('.btn-text');
 
     try {
+      txt.textContent = 'Memeriksa nama dosen...';
+      const chk = await fetch('/check-dosen', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prodi: payload.prodi, dosen: payload.dosen }),
+      });
+      const chkJson = await chk.json();
+      if (!chkJson.success) return showErrors(chkJson.errors || ['Nama dosen tidak valid.']);
+
       payload.skema = [];
       for (let i = 0; i < skema.length; i++) {
         txt.textContent = `Mengunggah skema ${i + 1} dari ${skema.length}...`;
@@ -559,6 +730,29 @@ def upload():
         return jsonify({"success": False, "errors": [f"Upload gagal: {e}"]}), 500
 
 
+@app.route("/api/dosen")
+def api_dosen():
+    names = load_daftar_dosen()
+    if not names:
+        return jsonify({"success": False, "dosen": [], "errors": ["Daftar dosen gagal dimuat."]}), 502
+    return jsonify({"success": True, "dosen": names})
+
+
+@app.route("/check-dosen", methods=["POST"])
+def check_dosen():
+    try:
+        data = request.get_json(force=True)
+        prodi = (data.get("prodi") or "").strip()
+        dosen, errs = kanonikkan_dosen(data.get("dosen", []))
+        errs = errs or cek_dosen_duplikat(prodi, dosen)
+        if errs:
+            return jsonify({"success": False, "errors": errs}), 409
+        return jsonify({"success": True})
+    except Exception as e:
+        logging.exception("Error di /check-dosen")
+        return jsonify({"success": False, "errors": [str(e)]}), 500
+
+
 @app.route("/submit", methods=["POST"])
 def submit():
     try:
@@ -583,6 +777,14 @@ def submit():
 
         if errors:
             return jsonify({"success": False, "errors": errors}), 422
+
+        dosen_valid, bad = kanonikkan_dosen(dosen_valid)
+        if bad:
+            return jsonify({"success": False, "errors": bad}), 422
+
+        dup = cek_dosen_duplikat(prodi, dosen_valid)
+        if dup:
+            return jsonify({"success": False, "errors": dup}), 409
 
         row = [
             datetime.now(WITA).strftime("%Y-%m-%d %H:%M:%S"),
