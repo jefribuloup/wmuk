@@ -370,6 +370,39 @@ HTML = r"""<!DOCTYPE html>
     .dosen-row input:focus { border-color:var(--gold); }
     .dosen-row input::placeholder { color:#9ca3af; font-size:12px; }
     @media (max-width:600px){ .dosen-row { grid-template-columns:1fr auto; } .dosen-row input:nth-child(2){ grid-column:1; } }
+    /* ── Dropdown dosen (combobox) ── */
+    .cb { position:relative; min-width:0; }
+    .dosen-row .cb-input { width:100%; padding:9px 34px 9px 12px; cursor:pointer; text-overflow:ellipsis; }
+    .cb.has-value .cb-input { font-weight:600; color:var(--navy); border-color:#d9c08a; background:#fffdf8; }
+    .cb.open .cb-input { border-color:var(--gold); box-shadow:0 0 0 3px rgba(201,151,44,.15); cursor:text; }
+    .cb-chev { position:absolute; right:11px; top:50%; width:16px; height:16px; margin-top:-8px; color:var(--gray);
+      pointer-events:none; transition:transform .2s; }
+    .cb.open .cb-chev { transform:rotate(180deg); color:var(--gold); }
+    .cb-panel { position:absolute; left:0; top:calc(100% + 6px); z-index:60; width:max(100%, 380px); max-width:calc(100vw - 48px);
+      background:var(--white); border:1px solid var(--gray-lt); border-radius:12px; overflow:hidden;
+      box-shadow:0 12px 32px rgba(13,33,55,.18), 0 2px 6px rgba(13,33,55,.08);
+      opacity:0; transform:translateY(-4px); pointer-events:none; visibility:hidden; transition:opacity .15s, transform .15s, visibility .15s; }
+    .cb.open .cb-panel { opacity:1; transform:none; pointer-events:auto; visibility:visible; }
+    .cb.up .cb-panel { top:auto; bottom:calc(100% + 6px); }
+    @media (max-width:600px){ .cb-panel { width:100%; } }
+    .cb-meta { padding:8px 14px; font-size:11px; letter-spacing:.04em; text-transform:uppercase; color:var(--gray);
+      background:#f8fafc; border-bottom:1px solid var(--gray-lt); }
+    .cb-list { max-height:248px; overflow-y:auto; padding:6px; overscroll-behavior:contain; }
+    .cb-opt { display:flex; align-items:center; gap:10px; padding:8px 10px; border-radius:8px; cursor:pointer; }
+    .cb-opt.is-active { background:#f4efe3; }
+    .cb-opt.is-selected { background:#fbf4df; }
+    .cb-opt.is-disabled { opacity:.45; cursor:not-allowed; }
+    .cb-avatar { flex:none; width:32px; height:32px; border-radius:50%; background:var(--navy); color:var(--gold-lt);
+      display:flex; align-items:center; justify-content:center; font-size:12px; font-weight:600; letter-spacing:.02em; }
+    .cb-opt.is-selected .cb-avatar { background:var(--gold); color:var(--white); }
+    .cb-txt { min-width:0; flex:1; line-height:1.25; }
+    .cb-name { font-size:13.5px; font-weight:600; color:var(--navy); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .cb-deg { font-size:11.5px; color:var(--gray); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .cb-opt mark { background:rgba(201,151,44,.28); color:inherit; border-radius:3px; padding:0 1px; }
+    .cb-tag { flex:none; font-size:10.5px; font-weight:600; color:var(--gray); background:var(--gray-lt); border-radius:999px; padding:2px 8px; }
+    .cb-check { flex:none; width:16px; height:16px; color:var(--gold); }
+    .cb-empty { padding:22px 14px; text-align:center; font-size:13px; color:var(--gray); }
+
 
     .skema-row { display:grid; grid-template-columns:1fr auto; gap:8px; align-items:start;
       background:#f8fafc; border:1.5px solid var(--gray-lt); border-radius:var(--radius); padding:12px; }
@@ -493,7 +526,6 @@ HTML = r"""<!DOCTYPE html>
 
     <div class="section-label">Dosen yang Diusulkan <small>(minimal 2 dosen)</small></div>
     <div class="dynamic-list" id="dosenList"></div>
-    <datalist id="dosenOptions"></datalist>
     <button class="btn-add" type="button" onclick="tambahDosen()">+ Tambah Dosen</button>
 
     <div class="section-label">Skema Kompetensi <small>(judul + file PDF, maks. 4 MB per file)</small></div>
@@ -519,6 +551,7 @@ HTML = r"""<!DOCTYPE html>
   let dosenCount = 0, skemaCount = 0;
 
   let DAFTAR_DOSEN = [];
+  let DOSEN_STATE = 'loading';      // loading | ok | fail
 
   async function muatDosen() {
     try {
@@ -526,23 +559,132 @@ HTML = r"""<!DOCTYPE html>
       const j = await r.json();
       if (!j.success) throw new Error('gagal');
       DAFTAR_DOSEN = j.dosen;
-      document.getElementById('dosenOptions').innerHTML =
-        DAFTAR_DOSEN.map(n => `<option value="${n.replace(/"/g, '&quot;')}"></option>`).join('');
+      DOSEN_STATE = 'ok';
     } catch (e) {
+      DOSEN_STATE = 'fail';
       showErrors(['Daftar dosen gagal dimuat. Muat ulang halaman.']);
     }
+    document.querySelectorAll('.cb.open').forEach(cbRender);
   }
 
-  function cariDosen(v) {
-    const k = (v || '').trim().replace(/\s+/g, ' ').toLowerCase();
-    return DAFTAR_DOSEN.find(n => n.toLowerCase() === k);
+  /* ── Combobox dosen ── */
+  const TITLE_RE = /^(dr|prof|ir|drs|h|hj)\.?$/i;
+  const esc = t => String(t).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+  function pecahNama(n) {
+    const i = n.indexOf(',');
+    return i < 0 ? [n, ''] : [n.slice(0, i).trim(), n.slice(i + 1).trim()];
+  }
+  function inisial(n) {
+    const w = pecahNama(n)[0].split(/\s+/).filter(x => x && !TITLE_RE.test(x));
+    const a = (w[0] || n)[0] || '?', b = w.length > 1 ? w[1][0] : '';
+    return (a + b).toUpperCase();
+  }
+  function hl(text, q) {
+    const t = q.split(/\s+/).filter(Boolean).map(x => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    if (!t.length) return esc(text);
+    return text.split(new RegExp('(' + t.join('|') + ')', 'i')).map((p, i) => i % 2 ? '<mark>' + esc(p) + '</mark>' : esc(p)).join('');
   }
 
-  function cekNamaDosen(el) {
-    if (!DAFTAR_DOSEN.length || !el.value.trim()) return;
-    const n = cariDosen(el.value);
-    if (n) el.value = n;
-    else { el.value = ''; showErrors(['Nama dosen harus dipilih dari daftar dropdown.']); }
+  function cbInit(cb) {
+    const input = cb.querySelector('.cb-input'), panel = cb.querySelector('.cb-panel');
+    cb._st = { sel: '', active: -1, items: [] };
+
+    input.addEventListener('focus', () => { cbOpen(cb); input.select(); });
+    input.addEventListener('click', () => cbOpen(cb));
+    input.addEventListener('input', () => {
+      cb._st.sel = DOSEN_STATE === 'ok' ? '' : input.value.trim();
+      cb.classList.remove('has-value');
+      cb._st.active = -1;
+      cbOpen(cb);
+    });
+    input.addEventListener('keydown', e => {
+      const st = cb._st;
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (!cb.classList.contains('open')) return cbOpen(cb);
+        const ok = st.items.map((it, i) => it.taken ? -1 : i).filter(i => i >= 0);
+        if (!ok.length) return;
+        let pos = ok.indexOf(st.active);
+        pos = e.key === 'ArrowDown' ? (pos + 1) % ok.length : (pos <= 0 ? ok.length - 1 : pos - 1);
+        st.active = ok[pos]; cbMarkActive(cb);
+      } else if (e.key === 'Enter') {
+        if (cb.classList.contains('open')) {
+          e.preventDefault();
+          const it = st.items[st.active >= 0 ? st.active : st.items.findIndex(x => !x.taken)];
+          if (it && !it.taken) cbPick(cb, it.name);
+        }
+      } else if (e.key === 'Escape') { cbClose(cb); }
+      else if (e.key === 'Tab') { cbClose(cb); }
+    });
+    panel.addEventListener('mousedown', e => e.preventDefault());   // jaga fokus input
+    panel.addEventListener('click', e => {
+      const el = e.target.closest('.cb-opt');
+      if (!el) return;
+      const it = cb._st.items[+el.dataset.i];
+      if (it && !it.taken) cbPick(cb, it.name);
+    });
+    input.addEventListener('blur', () => cbClose(cb));
+  }
+
+  function cbOpen(cb) {
+    document.querySelectorAll('.cb.open').forEach(o => { if (o !== cb) cbClose(o); });
+    cb.classList.add('open');
+    cb.querySelector('.cb-input').setAttribute('aria-expanded', 'true');
+    cbRender(cb);
+    const r = cb.getBoundingClientRect();
+    cb.classList.toggle('up', window.innerHeight - r.bottom < 330 && r.top > window.innerHeight - r.bottom);
+  }
+
+  function cbClose(cb) {
+    cb.classList.remove('open');
+    const input = cb.querySelector('.cb-input');
+    input.setAttribute('aria-expanded', 'false');
+    if (DOSEN_STATE === 'ok') input.value = cb._st.sel;       // teks yang tidak dipilih dibuang
+    cb.classList.toggle('has-value', !!cb._st.sel);
+  }
+
+  function cbPick(cb, name) {
+    cb._st.sel = name;
+    cb.querySelector('.cb-input').value = name;
+    cbClose(cb);
+    cb.querySelector('.cb-input').blur();
+  }
+
+  function cbRender(cb) {
+    const st = cb._st, panel = cb.querySelector('.cb-panel');
+    const input = cb.querySelector('.cb-input');
+    if (DOSEN_STATE === 'loading') { panel.innerHTML = '<div class="cb-empty">Memuat daftar dosen…</div>'; return; }
+    if (DOSEN_STATE === 'fail')    { panel.innerHTML = '<div class="cb-empty">Daftar dosen gagal dimuat.</div>'; return; }
+
+    const q = st.sel === input.value ? '' : input.value.trim();     // baru dipilih -> tampilkan semua
+    const toks = q.toLowerCase().split(/\s+/).filter(Boolean);
+    const taken = new Set([...document.querySelectorAll('.cb')].filter(x => x !== cb && x._st.sel).map(x => x._st.sel));
+    st.items = DAFTAR_DOSEN
+      .filter(n => toks.every(t => n.toLowerCase().includes(t)))
+      .map(n => ({ name: n, taken: taken.has(n) }));
+
+    const meta = `<div class="cb-meta">${st.items.length} dosen${q ? ' ditemukan' : ' tersedia'}</div>`;
+    if (!st.items.length) { panel.innerHTML = meta + '<div class="cb-empty">Tidak ada dosen yang cocok.<br>Coba kata kunci lain.</div>'; return; }
+
+    const check = '<svg class="cb-check" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 10.5l4 4 8-9"/></svg>';
+    panel.innerHTML = meta + '<div class="cb-list">' + st.items.map((it, i) => {
+      const [nm, deg] = pecahNama(it.name);
+      return `<div class="cb-opt${it.taken ? ' is-disabled' : ''}${it.name === st.sel ? ' is-selected' : ''}" role="option" data-i="${i}">
+        <div class="cb-avatar">${esc(inisial(it.name))}</div>
+        <div class="cb-txt"><div class="cb-name">${hl(nm, q)}</div>${deg ? `<div class="cb-deg">${hl(deg, q)}</div>` : ''}</div>
+        ${it.taken ? '<span class="cb-tag">Dipilih</span>' : (it.name === st.sel ? check : '')}
+      </div>`;
+    }).join('') + '</div>';
+
+    if (st.active < 0) st.active = Math.max(st.items.findIndex(x => x.name === st.sel), st.items.findIndex(x => !x.taken));
+    cbMarkActive(cb);
+  }
+
+  function cbMarkActive(cb) {
+    cb.querySelectorAll('.cb-opt').forEach(el => el.classList.toggle('is-active', +el.dataset.i === cb._st.active));
+    const a = cb.querySelector('.cb-opt.is-active');
+    if (a) a.scrollIntoView({ block: 'nearest' });
   }
 
   function init() {
@@ -557,10 +699,16 @@ HTML = r"""<!DOCTYPE html>
     const row = document.createElement('div');
     row.className = 'dosen-row'; row.id = `dosenRow${id}`;
     row.innerHTML = `
-      <input type="text" list="dosenOptions" autocomplete="off" placeholder="Pilih Nama Dosen ${id}" onchange="cekNamaDosen(this)" />
+      <div class="cb" id="cb${id}">
+        <input type="text" class="cb-input" autocomplete="off" spellcheck="false" role="combobox" aria-expanded="false"
+               aria-label="Nama Dosen ${id}" placeholder="Pilih nama dosen ${id}" />
+        <svg class="cb-chev" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 8l5 5 5-5"/></svg>
+        <div class="cb-panel" role="listbox"></div>
+      </div>
       <input type="tel" inputmode="tel" placeholder="No. HP / WA (cth. +6281234567890)" oninput="filterHp(this)" />
       <button class="btn-remove" type="button" onclick="hapusRow('dosenRow${id}','dosenList','dosenRow',2)" title="Hapus">&#215;</button>`;
     document.getElementById('dosenList').appendChild(row);
+    cbInit(row.querySelector('.cb'));
     updateRemoveButtons('dosenList', 'dosenRow', 2);
   }
 
@@ -598,10 +746,10 @@ HTML = r"""<!DOCTYPE html>
   }
 
   function collectDosen() {
-    return [...document.querySelectorAll('#dosenList .dosen-row')].map(row => {
-      const i = row.querySelectorAll('input');
-      return { nama: (i[0].value || '').trim(), hp: (i[1].value || '').trim() };
-    }).filter(d => d.nama);
+    return [...document.querySelectorAll('#dosenList .dosen-row')].map(row => ({
+      nama: (row.querySelector('.cb')._st.sel || '').trim(),
+      hp: (row.querySelector('input[type="tel"]').value || '').trim(),
+    })).filter(d => d.nama);
   }
 
   function collectSkema() {
@@ -641,7 +789,7 @@ HTML = r"""<!DOCTYPE html>
     const errs = [];
     if (!payload.prodi) errs.push('Program Studi wajib dipilih.');
     if (payload.dosen.length < 2) errs.push('Minimal 2 dosen harus diisi.');
-    if (DAFTAR_DOSEN.length && payload.dosen.some(d => !cariDosen(d.nama))) errs.push('Nama dosen harus dipilih dari daftar dropdown.');
+    if ([...document.querySelectorAll('#dosenList .cb')].some(c => c.querySelector('.cb-input').value.trim() && !c._st.sel)) errs.push('Nama dosen harus dipilih dari daftar dropdown.');
     if (payload.dosen.some(d => !d.hp)) errs.push('No. HP setiap dosen wajib diisi.');
     if (payload.dosen.some(d => d.hp && !/^\+?[0-9]+$/.test(d.hp))) errs.push('No. HP hanya boleh berisi angka dan tanda +.');
     skema.forEach((s, i) => {
