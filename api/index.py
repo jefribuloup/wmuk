@@ -437,6 +437,9 @@ HTML = r"""<!DOCTYPE html>
     .btn-submit:hover { background:#162f4f; }
     .btn-submit:active { transform:scale(.98); }
     .btn-submit:disabled { opacity:.6; cursor:not-allowed; }
+    #formWrapper input:disabled, #formWrapper select:disabled { opacity:.6; cursor:not-allowed; background:#eef0f3; }
+    .btn-add:disabled { opacity:.5; cursor:not-allowed; }
+    .btn-remove:disabled { cursor:not-allowed; }
 
     .alert { border-radius:var(--radius); padding:14px 16px; font-size:13px; line-height:1.5; margin-top:16px; display:none; }
     .alert.show { display:block; }
@@ -775,6 +778,17 @@ HTML = r"""<!DOCTYPE html>
     return json.url;
   }
 
+  function setFormBusy(busy) {
+    if (busy) document.querySelectorAll('.cb.open').forEach(cbClose);
+    document.querySelectorAll('#formWrapper input, #formWrapper select, #formWrapper textarea, #formWrapper button')
+      .forEach(el => { el.disabled = busy; });
+    document.getElementById('formWrapper').setAttribute('aria-busy', busy ? 'true' : 'false');
+    if (!busy) {   // pulihkan aturan tombol hapus (minimal baris)
+      updateRemoveButtons('dosenList', 'dosenRow', 2);
+      updateRemoveButtons('skemaList', 'skemaRow', 1);
+    }
+  }
+
   async function submitForm() {
     const btn = document.getElementById('btnSubmit');
     const alertEl = document.getElementById('alertError');
@@ -801,7 +815,7 @@ HTML = r"""<!DOCTYPE html>
     });
     if (errs.length) return showErrors(errs);
 
-    btn.disabled = true; btn.classList.add('loading');
+    setFormBusy(true); btn.classList.add('loading');
     const txt = btn.querySelector('.btn-text');
 
     try {
@@ -837,7 +851,7 @@ HTML = r"""<!DOCTYPE html>
     } catch (e) {
       showErrors([e.message || 'Gagal terhubung ke server. Periksa koneksi Anda.']);
     } finally {
-      btn.disabled = false; btn.classList.remove('loading');
+      setFormBusy(false); btn.classList.remove('loading');
       txt.textContent = 'Kirim Pendaftaran';
     }
   }
